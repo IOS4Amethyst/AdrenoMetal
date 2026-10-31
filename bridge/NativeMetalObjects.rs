@@ -190,6 +190,7 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         // Every texture given a shadow image is announced with why no image aliases its bytes (`shadow.log`).
         options.announce_each.insert(metal2vulkan_runtime::Degradation::ShadowedTexture);
         let _ = SHADOW_LOG.set(PathBuf::from(cache.to_string_lossy().into_owned()).join("shadow.log"));
+        let _ = TEXTURE_LOG.set(PathBuf::from(cache.to_string_lossy().into_owned()).join("gpu").join(format!("textures-{}.txt", std::process::id())));
         let device = Device::system_default_with(&options).map_err(e("device"))?;
         // No caller moves or detaches the pages of a no-copy buffer (the frontend has no rebind or detach): the encoders log no calls
         // to encode again and hold no surface's buffer per command, which every frame of the render server paid for.
@@ -231,6 +232,47 @@ fn note_shadow(text: &str) {
             let _ = writeln!(file, "{text}");
         }
     }
+}
+
+// T80 l: each texture made over a buffer, one line in the cache directory's gpu/textures-<pid>.txt (the boot export takes that
+// directory), the first TEXTURE_LINES of them, then every 100th: n, kind (b a buffer, s a surface without planes, l the linear SPI),
+// pixel format, texel bytes, width x height, offset, rows, usage, Turnip's own row for a linear image of that width (64 bytes a texel
+// byte), the rows' class (D Turnip's own, E a multiple of 64 that is not, N no multiple of 64), what the runtime's counts of textures in
+// place and of them at Metal's pitch gained (in/pitched: 1/0 Turnip's linear image, 1/1 one laid out at the texture's rows, 0/0 a
+// shadow), and the buffer's address and length. T79 scrambled small textures in blocks; this says which went in place, and how.
+static TEXTURE_LOG: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+static TEXTURE_LOGGED: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+const TEXTURE_LINES: u64 = 4000;
+
+fn texture_log<T, E>(kind: char, buffer: &Buffer, d: &NmbTextureDescriptor, offset: u64, rows: u64, make: impl FnOnce() -> Result<T, E>)
+                     -> Result<T, E> {
+    if !t80_letter('l') {
+        return make();
+    }
+    // Held across the making, so the counts' gain is this texture's (textures over buffers come from one thread at a time anyway).
+    let Ok(mut logged) = TEXTURE_LOGGED.lock() else { return make() };
+    let device = buffer.device();
+    let before = device.work_counts();
+    let made = make();
+    let after = device.work_counts();
+    *logged += 1;
+    if *logged > TEXTURE_LINES && *logged % 100 != 0 {
+        return made;
+    }
+    let texel = device.pixel_format_info(d.format).words[0];
+    let own = if texel == 0 { 0 } else { (d.width * texel).next_multiple_of(64 * texel.next_power_of_two()) };
+    let class = if rows == own { 'D' } else if rows % 64 == 0 { 'E' } else { 'N' };
+    let line = format!("{} {kind} fmt {} t{texel} {}x{} o{offset} r{rows} u{:x} own {own} {class} in {}/{} {} @{:x}+{}\n", *logged,
+                       d.format, d.width, d.height, d.usage,
+                       after.host_textures_in_place - before.host_textures_in_place, after.pitched_host_images - before.pitched_host_images,
+                       if made.is_ok() { "made" } else { "REFUSED" }, buffer.contents().map_or(0, |p| p.as_ptr() as usize), buffer.length());
+    if let Some(path) = TEXTURE_LOG.get() {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = file.write_all(line.as_bytes());
+        }
+    }
+    made
 }
 
 // NATIVE_METAL_WARNINGS=1: each kind of message (its id and the text's first 48 characters) the first time it comes, in full and
@@ -617,13 +659,37 @@ pub extern "C" fn nmb_device_family_waivers(device: *const NmbDevice, out: *mut 
 /// answer; one placed at 64 binds in place. The IOSurface answers stay the runtime's: no IOSurface texture was shadowed, and the
 /// compositor's surfaces keep their strides.
 const LINEAR_IN_PLACE: u64 = 64;
+/// T80 w: the answer where no format is named, BGRA8's 64 texels.
+const LINEAR_TEXELS_UNNAMED: u64 = 256;
+
+/// T80 boot letters (TU_DW_TRACE), the A/B of T79, where the 64-byte answer took the copies away and scrambled small textures (text,
+/// icons, the wallpaper's shadow) in blocks: o answers the runtime's own alignment (T78's layout); w answers 64 texels, Turnip's own row
+/// step for a linear image (64 bytes a texel byte: 256 for BGRA8), and 256 where no format is named; r answers the runtime's for
+/// formats of 1- and 2-byte texels and 64 for the others; none answers 64 (T79). l logs each texture over a buffer (texture_log).
+fn t80_letter(letter: char) -> bool {
+    static LETTERS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    LETTERS.get_or_init(|| std::env::var("TU_DW_TRACE").unwrap_or_default()).contains(letter)
+}
+
+/// The linear alignment answered for a format of `texel` bytes (None where the query names no format) whose runtime answer is
+/// `runtime`, by the T80 letters.
+fn linear_answer(texel: Option<u64>, runtime: u64) -> u64 {
+    if t80_letter('o') || (t80_letter('r') && texel.is_some_and(|t| t <= 2)) {
+        return runtime;
+    }
+    if t80_letter('w') {
+        return texel.map_or(LINEAR_TEXELS_UNNAMED, |t| 64 * t.next_power_of_two()).max(runtime);
+    }
+    runtime.max(LINEAR_IN_PLACE)
+}
 
 fn device_answer(device: &NmbDevice, selector: &str, arg: u64) -> Result<u64, String> {
     let d = &device.0;
     let p = d.properties();
     let none = || format!("the device has no answer for {selector}");
     if matches!(selector, "deviceLinearTextureAlignmentBytes" | "linearTextureAlignmentBytes" | "deviceLinearReadOnlyTextureAlignmentBytes") {
-        return Ok(LINEAR_IN_PLACE);
+        let runtime = device.private().count(PrivateCount::DeviceLinearTextureAlignmentBytes).value().ok_or_else(none)?;
+        return Ok(linear_answer(None, runtime));
     }
     if let Some(c) = PrivateCount::ALL.into_iter().find(|c| c.selector() == selector) {
         return device.private().count(c).value().ok_or_else(none);
@@ -660,11 +726,13 @@ fn device_answer(device: &NmbDevice, selector: &str, arg: u64) -> Result<u64, St
         }
         "supportsYCBCRFormats12" => format_supported(PixelFormat::YCBCR124202P) as u64,
         "supportsYCBCRPackedFormats12" => format_supported(PixelFormat::YCBCR124202PPACKED) as u64,
-        // The runtime refuses the formats no buffer backs; the others are placed at LINEAR_IN_PLACE.
-        "minimumLinearTextureAlignmentForPixelFormat:" => p
-            .minimum_linear_texture_alignment_for_pixel_format(raw::<PixelFormat>(arg, "pixel format")?)
-            .map_err(e("minimum linear texture alignment"))?
-            .max(LINEAR_IN_PLACE),
+        // The runtime refuses the formats no buffer backs; the others are placed by linear_answer.
+        "minimumLinearTextureAlignmentForPixelFormat:" => {
+            let runtime = p
+                .minimum_linear_texture_alignment_for_pixel_format(raw::<PixelFormat>(arg, "pixel format")?)
+                .map_err(e("minimum linear texture alignment"))?;
+            linear_answer(Some(d.pixel_format_info(arg).words[0]), runtime)
+        }
         "supportsTextureSampleCount:" => gap(p.supports_texture_sample_count(arg))?,
         "supportsVertexAmplificationCount:" => gap(p.supports_vertex_amplification_count(arg))?,
         "supportsRasterizationRateMapWithLayerCount:" => gap(p.supports_rasterization_rate_map_with_layer_count(arg))?,
@@ -701,7 +769,7 @@ pub unsafe extern "C" fn nmb_device_answer(device: *const NmbDevice, selector: *
 pub extern "C" fn nmb_device_linear_bytes_per_row(device: *const NmbDevice, format: u64, width: u64) -> u64 {
     guard(0, || {
         let d = &get(device)?.0;
-        let alignment = d
+        let runtime = d
             .properties()
             .minimum_linear_texture_alignment_for_pixel_format(raw::<PixelFormat>(format, "pixel format")?)
             .map_err(e("linear texture"))?;
@@ -710,6 +778,9 @@ pub extern "C" fn nmb_device_linear_bytes_per_row(device: *const NmbDevice, form
         if info.flags & 0x400 != 0 || info.words[0] == 0 {
             return Err(format!("pixel format {format} has no texel size"));
         }
+        // The device's answer to minimumLinearTextureAlignmentForPixelFormat:, so both rules lay a texture out alike (T79 padded these
+        // rows to the runtime's 16 while the query answered 64).
+        let alignment = linear_answer(Some(info.words[0]), runtime);
         Ok((width * info.words[0]).div_ceil(alignment) * alignment)
     })
 }
@@ -1413,13 +1484,16 @@ pub extern "C" fn nmb_texture_new(device: *mut NmbDevice, descriptor: *const Nmb
 pub extern "C" fn nmb_texture_new_on_buffer(buffer: *mut NmbBuffer, descriptor: *const NmbTextureDescriptor, offset: u64,
                                             bytes_per_row: u64, iosurface: bool) -> *mut NmbTexture {
     guard(std::ptr::null_mut(), || {
+        let shape = get(descriptor)?;
         let descriptor = texture_descriptor(descriptor)?;
         let buffer = &get(buffer)?.0;
-        let texture = if iosurface {
-            buffer.new_texture_with_iosurface_plane(&descriptor, IoSurfacePlane::new(offset, bytes_per_row, false))
-        } else {
-            buffer.new_texture(&descriptor, offset, bytes_per_row)
-        };
+        let texture = texture_log(if iosurface { 's' } else { 'b' }, buffer, shape, offset, bytes_per_row, || {
+            if iosurface {
+                buffer.new_texture_with_iosurface_plane(&descriptor, IoSurfacePlane::new(offset, bytes_per_row, false))
+            } else {
+                buffer.new_texture(&descriptor, offset, bytes_per_row)
+            }
+        });
         Ok(boxed(NmbTexture(texture.map_err(e("texture over buffer"))?)))
     })
 }
@@ -1448,8 +1522,11 @@ pub extern "C" fn nmb_texture_new_on_surface(buffer: *mut NmbBuffer, descriptor:
 pub extern "C" fn nmb_texture_new_linear(buffer: *mut NmbBuffer, descriptor: *const NmbTextureDescriptor, offset: u64, bytes_per_row: u64,
                                          bytes_per_image: u64) -> *mut NmbTexture {
     guard(std::ptr::null_mut(), || {
+        let shape = get(descriptor)?;
         let descriptor = texture_descriptor(descriptor)?;
-        let texture = get(buffer)?.0.new_linear_texture(&descriptor, offset, bytes_per_row, bytes_per_image);
+        let buffer = &get(buffer)?.0;
+        let texture = texture_log('l', buffer, shape, offset, bytes_per_row,
+                                  || buffer.new_linear_texture(&descriptor, offset, bytes_per_row, bytes_per_image));
         Ok(boxed(NmbTexture(texture.map_err(e("linear texture"))?)))
     })
 }
