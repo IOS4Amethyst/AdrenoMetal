@@ -680,11 +680,34 @@ fn render_server() -> bool {
     })
 }
 
-/// The linear alignment answered where the runtime answers `runtime`: at least LINEAR_IN_PLACE in the render server, the runtime's own
-/// elsewhere. T79-T85: with 64 in every process the wallpaper's blurred shadows (drawn by the poster, not the render server) came out in
-/// blocks, while every texture the render server sampled held its bytes as written (T85 dumps) and its GPU read them so (T83x).
-fn linear_answer(runtime: u64) -> u64 {
-    if render_server() { runtime.max(LINEAR_IN_PLACE) } else { runtime }
+/// The linear alignment answered where the runtime answers `runtime`, for `selector` (and its argument, a pixel format or a width):
+/// at least LINEAR_IN_PLACE in the render server, the runtime's own elsewhere. T86: with 64 in the render server alone the blocks
+/// stayed, and with the runtime's 16 everywhere (T80o) they went: the render server's answer draws them, though every texture it
+/// sampled held its bytes as written (T85 dumps) and its GPU read them so (T83x). T87 letters put one answer back to the runtime's in
+/// the render server: A the format-free ones (deviceLinearTextureAlignmentBytes and its two siblings), B
+/// minimumLinearTextureAlignmentForPixelFormat:, C requiredLinearTextureBytesPerRowForDescriptor:'s row step. With l each distinct
+/// question and answer goes to m2v/gpu/answers-<pid>.txt once.
+fn linear_answer(selector: &str, argument: u64, runtime: u64) -> u64 {
+    let letter = match selector {
+        "minimumLinearTextureAlignmentForPixelFormat:" => 'B',
+        "requiredLinearTextureBytesPerRowForDescriptor:" => 'C',
+        _ => 'A',
+    };
+    let answer = if render_server() && !t80_letter(letter) { runtime.max(LINEAR_IN_PLACE) } else { runtime };
+    if t80_letter('l') {
+        static SEEN: std::sync::Mutex<Vec<(String, u64)>> = std::sync::Mutex::new(Vec::new());
+        let mut seen = SEEN.lock().unwrap_or_else(|p| p.into_inner());
+        if seen.len() < 400 && !seen.iter().any(|(s, a)| s == selector && *a == argument) {
+            seen.push((selector.to_owned(), argument));
+            if let Some(path) = TEXTURE_LOG.get().and_then(|p| p.parent()).map(|d| d.join(format!("answers-{}.txt", std::process::id()))) {
+                use std::io::Write;
+                if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                    let _ = writeln!(file, "{selector} {argument} runtime {runtime} answer {answer}");
+                }
+            }
+        }
+    }
+    answer
 }
 
 fn device_answer(device: &NmbDevice, selector: &str, arg: u64) -> Result<u64, String> {
@@ -693,7 +716,7 @@ fn device_answer(device: &NmbDevice, selector: &str, arg: u64) -> Result<u64, St
     let none = || format!("the device has no answer for {selector}");
     if matches!(selector, "deviceLinearTextureAlignmentBytes" | "linearTextureAlignmentBytes" | "deviceLinearReadOnlyTextureAlignmentBytes") {
         let runtime = device.private().count(PrivateCount::DeviceLinearTextureAlignmentBytes).value().ok_or_else(none)?;
-        return Ok(linear_answer(runtime));
+        return Ok(linear_answer(selector, 0, runtime));
     }
     if let Some(c) = PrivateCount::ALL.into_iter().find(|c| c.selector() == selector) {
         return device.private().count(c).value().ok_or_else(none);
@@ -735,7 +758,7 @@ fn device_answer(device: &NmbDevice, selector: &str, arg: u64) -> Result<u64, St
             let runtime = p
                 .minimum_linear_texture_alignment_for_pixel_format(raw::<PixelFormat>(arg, "pixel format")?)
                 .map_err(e("minimum linear texture alignment"))?;
-            linear_answer(runtime)
+            linear_answer(selector, arg, runtime)
         }
         "supportsTextureSampleCount:" => gap(p.supports_texture_sample_count(arg))?,
         "supportsVertexAmplificationCount:" => gap(p.supports_vertex_amplification_count(arg))?,
@@ -784,7 +807,7 @@ pub extern "C" fn nmb_device_linear_bytes_per_row(device: *const NmbDevice, form
         }
         // The device's answer to minimumLinearTextureAlignmentForPixelFormat:, so both rules lay a texture out alike (T79 padded these
         // rows to the runtime's 16 while the query answered 64).
-        let alignment = linear_answer(runtime);
+        let alignment = linear_answer("requiredLinearTextureBytesPerRowForDescriptor:", format, runtime);
         Ok((width * info.words[0]).div_ceil(alignment) * alignment)
     })
 }
