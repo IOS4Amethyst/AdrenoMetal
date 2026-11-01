@@ -659,27 +659,16 @@ pub extern "C" fn nmb_device_family_waivers(device: *const NmbDevice, out: *mut 
 /// answer; one placed at 64 binds in place. The IOSurface answers stay the runtime's: no IOSurface texture was shadowed, and the
 /// compositor's surfaces keep their strides.
 const LINEAR_IN_PLACE: u64 = 64;
-/// T80 w: the answer where no format is named, BGRA8's 64 texels.
-const LINEAR_TEXELS_UNNAMED: u64 = 256;
 
-/// T80 boot letters (TU_DW_TRACE), the A/B of T79, where the 64-byte answer took the copies away and scrambled small textures (text,
-/// icons, the wallpaper's shadow) in blocks: o answers the runtime's own alignment (T78's layout); w answers 64 texels, Turnip's own row
-/// step for a linear image (64 bytes a texel byte: 256 for BGRA8), and 256 where no format is named; r answers the runtime's for
-/// formats of 1- and 2-byte texels and 64 for the others; none answers 64 (T79). l logs each texture over a buffer (texture_log).
+/// Whether the boot letters (TU_DW_TRACE) hold `letter`: l logs each texture over a buffer (texture_log). T80's o, w and r (other
+/// alignment answers) changed no layout that mattered and are gone.
 fn t80_letter(letter: char) -> bool {
     static LETTERS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     LETTERS.get_or_init(|| std::env::var("TU_DW_TRACE").unwrap_or_default()).contains(letter)
 }
 
-/// The linear alignment answered for a format of `texel` bytes (None where the query names no format) whose runtime answer is
-/// `runtime`, by the T80 letters.
-fn linear_answer(texel: Option<u64>, runtime: u64) -> u64 {
-    if t80_letter('o') || (t80_letter('r') && texel.is_some_and(|t| t <= 2)) {
-        return runtime;
-    }
-    if t80_letter('w') {
-        return texel.map_or(LINEAR_TEXELS_UNNAMED, |t| 64 * t.next_power_of_two()).max(runtime);
-    }
+/// The linear alignment answered where the runtime answers `runtime`: at least LINEAR_IN_PLACE.
+fn linear_answer(runtime: u64) -> u64 {
     runtime.max(LINEAR_IN_PLACE)
 }
 
@@ -689,7 +678,7 @@ fn device_answer(device: &NmbDevice, selector: &str, arg: u64) -> Result<u64, St
     let none = || format!("the device has no answer for {selector}");
     if matches!(selector, "deviceLinearTextureAlignmentBytes" | "linearTextureAlignmentBytes" | "deviceLinearReadOnlyTextureAlignmentBytes") {
         let runtime = device.private().count(PrivateCount::DeviceLinearTextureAlignmentBytes).value().ok_or_else(none)?;
-        return Ok(linear_answer(None, runtime));
+        return Ok(linear_answer(runtime));
     }
     if let Some(c) = PrivateCount::ALL.into_iter().find(|c| c.selector() == selector) {
         return device.private().count(c).value().ok_or_else(none);
@@ -731,7 +720,7 @@ fn device_answer(device: &NmbDevice, selector: &str, arg: u64) -> Result<u64, St
             let runtime = p
                 .minimum_linear_texture_alignment_for_pixel_format(raw::<PixelFormat>(arg, "pixel format")?)
                 .map_err(e("minimum linear texture alignment"))?;
-            linear_answer(Some(d.pixel_format_info(arg).words[0]), runtime)
+            linear_answer(runtime)
         }
         "supportsTextureSampleCount:" => gap(p.supports_texture_sample_count(arg))?,
         "supportsVertexAmplificationCount:" => gap(p.supports_vertex_amplification_count(arg))?,
@@ -780,7 +769,7 @@ pub extern "C" fn nmb_device_linear_bytes_per_row(device: *const NmbDevice, form
         }
         // The device's answer to minimumLinearTextureAlignmentForPixelFormat:, so both rules lay a texture out alike (T79 padded these
         // rows to the runtime's 16 while the query answered 64).
-        let alignment = linear_answer(Some(info.words[0]), runtime);
+        let alignment = linear_answer(runtime);
         Ok((width * info.words[0]).div_ceil(alignment) * alignment)
     })
 }
