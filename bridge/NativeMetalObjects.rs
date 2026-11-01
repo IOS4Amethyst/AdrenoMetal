@@ -667,9 +667,24 @@ fn t80_letter(letter: char) -> bool {
     LETTERS.get_or_init(|| std::env::var("TU_DW_TRACE").unwrap_or_default()).contains(letter)
 }
 
-/// The linear alignment answered where the runtime answers `runtime`: at least LINEAR_IN_PLACE.
+/// Whether this process is the render server (backboardd), whose textures over buffers the 64-byte answer binds in place.
+fn render_server() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        unsafe extern "C" {
+            fn getprogname() -> *const c_char;
+        }
+        // SAFETY: getprogname returns the process's name, a NUL-terminated string that lives as long as the process, or null.
+        let name = unsafe { getprogname() };
+        !name.is_null() && unsafe { CStr::from_ptr(name) }.to_bytes() == b"backboardd"
+    })
+}
+
+/// The linear alignment answered where the runtime answers `runtime`: at least LINEAR_IN_PLACE in the render server, the runtime's own
+/// elsewhere. T79-T85: with 64 in every process the wallpaper's blurred shadows (drawn by the poster, not the render server) came out in
+/// blocks, while every texture the render server sampled held its bytes as written (T85 dumps) and its GPU read them so (T83x).
 fn linear_answer(runtime: u64) -> u64 {
-    runtime.max(LINEAR_IN_PLACE)
+    if render_server() { runtime.max(LINEAR_IN_PLACE) } else { runtime }
 }
 
 fn device_answer(device: &NmbDevice, selector: &str, arg: u64) -> Result<u64, String> {
