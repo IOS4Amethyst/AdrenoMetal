@@ -1512,14 +1512,87 @@ static void notified(void *context,uint64_t value) {
 // samples (a texture over an IOSurface or over a no-copy buffer, at most 1 MiB of rows) is hashed at commit and again at completion.
 // One that changed in between was rewritten by its client while the GPU could read it, which puts two frames' rows into one frame
 // (garbled labels, the status bar clock). Logged "native-metal: source-race ...", the first 50 of each kind and every 500th.
-static const bool gWatchSources=isRenderServer() && access("/private/var/ngpu/debug/source-race",F_OK)==0;
-struct WatchedSource {const uint8_t *bytes;size_t length;uint64_t hash;bool surface;uint32_t width,height,row;};
+// T83: also with the boot letter x (TU_DW_TRACE), which watches textures over any buffer and reads each unchanged source back through
+// the GPU (gpuReadback); the counts are the RC, RB and RF rows.
+static bool traceLetter(char letter) {const char *letters=getenv("TU_DW_TRACE");return letters && strchr(letters,letter);}
+static bool watchSources() {
+ static const bool on=isRenderServer() && (access("/private/var/ngpu/debug/source-race",F_OK)==0 || traceLetter('x'));
+ return on;
+}
+struct WatchedSource {const uint8_t *bytes;size_t length;uint64_t hash;bool surface;uint32_t width,height,row;NBTexture *texture;};
 static std::atomic<uint64_t> gSourcesWatched[2],gSourcesRaced[2];
 static uint64_t hashSource(const uint8_t *bytes,size_t length) {
  uint64_t hash=1469598103934665603ull,word;size_t at=0;
  for(;at+8<=length;at+=8){memcpy(&word,bytes+at,8);hash=(hash^word)*1099511628211ull;}
  for(;at<length;at++)hash=(hash^bytes[at])*1099511628211ull;
  return hash;
+}
+// T83 (boot letter x): a watched 2D source its client left unchanged while the GPU could read it is copied back through the GPU, on a
+// queue of its own, and compared with its bytes as the CPU sees them. A difference is the GPU reading other bytes than the client wrote
+// (other pages behind the address, or lines the CPU's caches still held). gReadback: checks, equal, different, moved (the client changed
+// it before the copy came back, or the copy failed), skipped (the queue busy, the format not one of whole texels); of the different
+// sources, 64-byte lines and 4 KiB pages that differ, of those compared, and sources whose differing bytes all read back as zero.
+static std::atomic<uint64_t> gReadback[10];
+static std::atomic<unsigned> gReadbackFirstCount{0};
+static char gReadbackFirst[4][96];
+static uint32_t readbackTexelBytes(uint64_t format) {
+ if(format==1 || (format>=10 && format<=14))return 1;                      // A8, R8
+ if((format>=20 && format<=25) || (format>=30 && format<=34))return 2;     // R16, RG8
+ if((format>=53 && format<=55) || (format>=60 && format<=65) || (format>=70 && format<=81) || (format>=90 && format<=94))return 4;
+ if((format>=103 && format<=105) || (format>=110 && format<=115))return 8; // RG32, RGBA16
+ if(format>=123 && format<=125)return 16;                                  // RGBA32
+ return 0;
+}
+static void gpuReadback(const WatchedSource &source) {
+ static std::atomic<int> inFlight{0};
+ static dispatch_queue_t queue=dispatch_queue_create("native-metal.readback",DISPATCH_QUEUE_SERIAL);
+ NBTexture *texture=source.texture;
+ const uint32_t texel=texture?readbackTexelBytes(texture.descriptor.format):0;
+ if(!traceLetter('x') || !texel || texture.descriptor.type!=MTLTextureType2D || (uint64_t)source.width*texel>source.row ||
+    inFlight.load()>=4){gReadback[4]++;return;}
+ inFlight++;
+ const uint8_t *bytes=source.bytes;const size_t length=source.length;const uint64_t hash=source.hash;
+ const uint32_t width=source.width,height=source.height,row=source.row;
+ dispatch_async(queue,^{
+  static id<MTLCommandQueue> commands;
+  id<MTLDevice> device=[(id<MTLTexture>)texture device];
+  if(!commands)commands=[device newCommandQueue];
+  id<MTLBuffer> out=[device newBufferWithLength:(NSUInteger)row*height options:MTLResourceStorageModeShared];
+  id<MTLCommandBuffer> commandBuffer=[commands commandBuffer];
+  id<MTLBlitCommandEncoder> blit=[commandBuffer blitCommandEncoder];
+  [blit copyFromTexture:(id<MTLTexture>)texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
+             sourceSize:MTLSizeMake(width,height,1) toBuffer:out destinationOffset:0 destinationBytesPerRow:row
+destinationBytesPerImage:(NSUInteger)row*height];
+  [blit endEncoding];[commandBuffer commit];[commandBuffer waitUntilCompleted];
+  gReadback[0]++;
+  if(!out || commandBuffer.status!=MTLCommandBufferStatusCompleted || hashSource(bytes,length)!=hash){gReadback[3]++;inFlight--;return;}
+  const uint8_t *gpu=(const uint8_t *)out.contents;
+  const size_t used=(size_t)width*texel;
+  size_t differing=0,zero=0,lines=0,linesSeen=0,pages=0,pagesSeen=0;
+  uintptr_t lastLine=0,lastLineSeen=0,lastPage=0,lastPageSeen=0;
+  uint32_t firstRow=0,firstColumn=0;
+  for(uint32_t y=0;y<height;y++)
+   for(size_t x=0;x<used;x++) {
+    const size_t at=(size_t)y*row+x;
+    const uintptr_t line=((uintptr_t)(bytes+at))>>6,page=((uintptr_t)(bytes+at))>>12;
+    if(line!=lastLineSeen){linesSeen++;lastLineSeen=line;}
+    if(page!=lastPageSeen){pagesSeen++;lastPageSeen=page;}
+    if(gpu[at]==bytes[at])continue;
+    if(!differing++){firstRow=y;firstColumn=(uint32_t)x;}
+    zero+=gpu[at]==0;
+    if(line!=lastLine){lines++;lastLine=line;}
+    if(page!=lastPage){pages++;lastPage=page;}
+   }
+  if(!differing)gReadback[1]++;
+  else {
+   gReadback[2]++;gReadback[5]+=lines;gReadback[6]+=linesSeen;gReadback[7]+=pages;gReadback[8]+=pagesSeen;gReadback[9]+=zero==differing;
+   const unsigned slot=gReadbackFirstCount.fetch_add(1);
+   if(slot<4)snprintf(gReadbackFirst[slot],sizeof gReadbackFirst[slot],"f%llu %ux%u r%u +%llx b%zu l%zu/%zu p%zu/%zu y%u x%u%s",
+                      (unsigned long long)texture.descriptor.format,width,height,row,(unsigned long long)((uintptr_t)bytes&0xfff),differing,
+                      lines,linesSeen,pages,pagesSeen,firstRow,firstColumn,zero==differing?" z":"");
+  }
+  inFlight--;
+ });
 }
 // With the texture log on, the 30 commits after /private/var/ngpu/debug/dump-now is touched (its modification time changes;
 // the render server may read it but not remove it) list every texture they use in surf/manifest.txt of this process's temporary
@@ -1597,7 +1670,7 @@ static void dumpSurfacesOnce(NSSet *textures,NSSet *owners) {
 // Runtime handles retain GPU storage, but only the Objective-C owner retains
 // a no-copy deallocator, its memory owner and texture/heap ancestry.
 @property(nonatomic,strong) NSMutableSet *resourceOwners;
-// The sampled sources watched for a rewrite while the GPU could read them (gWatchSources), kept alive until completion.
+// The sampled sources watched for a rewrite while the GPU could read them (watchSources), kept alive until completion.
 @property(nonatomic,strong) NSMutableSet *sampled;
 - (void)watchTexture:(NBTexture *)texture;
 @property(nonatomic,strong) dispatch_group_t handlers;
@@ -1962,7 +2035,7 @@ static void writeDrawStats() {
  if(texture)[_commandBuffer.resourceOwners addObject:texture];
  [self dumpBind:texture index:index stage:stage+4];
  if(texture && [(NBTexture *)texture surface])[_commandBuffer.surfaces addObject:texture];
- if(texture && gWatchSources)[_commandBuffer watchTexture:(NBTexture *)texture];
+ if(texture && watchSources())[_commandBuffer watchTexture:(NBTexture *)texture];
  ENCODE([self check:nmb_encoder_set_texture(self->_handle,stage,texture?[(NBTexture *)texture handle]:nullptr,(uint32_t)index) what:"setTexture"]);
 }
 - (void)sampler:(id<MTLSamplerState>)sampler index:(NSUInteger)index stage:(uint32_t)stage {
@@ -2517,13 +2590,14 @@ static char kUserDictionaryKey;
 - (void)dealloc {nmb_command_buffer_release(_handle);}
 - (void)watchTexture:(NBTexture *)texture {
  const uint8_t *bytes=texture.surface?(const uint8_t *)IOSurfaceGetBaseAddress(texture.surface):(const uint8_t *)texture.buffer.wrapped;
+ if(!bytes && texture.buffer && traceLetter('x'))bytes=(const uint8_t *)[texture.buffer contents];
  const size_t length=(size_t)texture.rowBytes*(size_t)texture.descriptor.height;
  if(!bytes || !length || length>(1u<<20) || self.committed)return;
  if(!_sampled)_sampled=[NSMutableSet set];
  if([_sampled containsObject:texture])return;
  [_sampled addObject:texture];
  watched.push_back({bytes+texture.offset,length,0,texture.surface!=nullptr,(uint32_t)texture.descriptor.width,
-                    (uint32_t)texture.descriptor.height,(uint32_t)texture.rowBytes});
+                    (uint32_t)texture.descriptor.height,(uint32_t)texture.rowBytes,texture});
 }
 - (id<MTLCommandQueue>)commandQueue {return (id<MTLCommandQueue>)_queue;}
 - (BOOL)retainedReferences {return YES;}
@@ -2738,6 +2812,7 @@ static char kUserDictionaryKey;
            source.surface?"IOSurface":"no-copy buffer",source.width,source.height,source.row,(unsigned long long)raced,
            (unsigned long long)gSourcesWatched[source.surface].load());
    }
+   else if(!self.failedLocally)gpuReadback(source);
   watched.clear();[_sampled removeAllObjects];
  }
  // The runtime reports Vulkan's DeviceLost as Metal's code 11 (see -error).
@@ -4245,6 +4320,15 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   (unsigned long long)gNoCopyMade.load(),
   (unsigned long long)gSurfaceImportsReleased.load(),(unsigned long long)gSurfaceImportsMade.load());
  {uint64_t remaps[2]={};if(nmb_no_copy_remaps(remaps))row("N no-copy ranges checked %llu remapped %llu",(unsigned long long)remaps[0],(unsigned long long)remaps[1]);}
+ // T83 (boot letter x): sources watched and rewritten while the GPU could read them (buffers/surfaces); the GPU read-backs (gpuReadback):
+ // checks, equal, different, moved, skipped | of the different, lines and pages differing of those compared, all-zero; the first four.
+ if(watchSources()) {
+  auto u=[](std::atomic<uint64_t> &v){return (unsigned long long)v.load();};
+  row("RC watched %llu/%llu raced %llu/%llu",u(gSourcesWatched[0]),u(gSourcesWatched[1]),u(gSourcesRaced[0]),u(gSourcesRaced[1]));
+  row("RB n%llu eq%llu ne%llu mv%llu sk%llu | l%llu/%llu p%llu/%llu z%llu",u(gReadback[0]),u(gReadback[1]),u(gReadback[2]),u(gReadback[3]),
+   u(gReadback[4]),u(gReadback[5]),u(gReadback[6]),u(gReadback[7]),u(gReadback[8]),u(gReadback[9]));
+  for(unsigned i=0;i<4 && i<gReadbackFirstCount.load();i++)row("RF %s",gReadbackFirst[i]);
+ }
  // The runtime's VkPipeline makings (the creation log, METAL2VULKAN_LOG_PIPELINES; they happen at draws, not at the state's creation) and
  // its shader cache: where the driver's compile time goes.
  uint64_t work[10]={};

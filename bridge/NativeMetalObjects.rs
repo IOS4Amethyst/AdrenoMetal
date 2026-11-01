@@ -183,6 +183,11 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         // server's surfaces and padded framebuffers (3048x2032 BGRA8 at 12288-byte rows, int-251) were otherwise copied in and out of a
         // shadow image every pass.
         options.policy.host_page_textures = metal2vulkan::device::HostPageTexturePolicy::InPlaceWrites;
+        // T83 boot letter v: every texture over host pages is a shadow copied in before its use, as T78's were, while the linear
+        // answers stay 64 (T79): blocks with v are in the layout the answer brings, none are in reading the bytes in place.
+        if t80_letter('v') {
+            options.policy.host_page_textures = metal2vulkan::device::HostPageTexturePolicy::Shadow;
+        }
         // Metal makes a pipeline state's pipeline at its creation and never drops a draw for a pipeline being made; the runtime's
         // default (PipelineWaitPolicy::Bounded) drops the draws and dispatches of a pipeline not made 4.5 s after the commit, which the
         // render server showed as missing pieces of the screen while it compiled (int 590aaee2).
@@ -660,8 +665,8 @@ pub extern "C" fn nmb_device_family_waivers(device: *const NmbDevice, out: *mut 
 /// compositor's surfaces keep their strides.
 const LINEAR_IN_PLACE: u64 = 64;
 
-/// Whether the boot letters (TU_DW_TRACE) hold `letter`: l logs each texture over a buffer (texture_log). T80's o, w and r (other
-/// alignment answers) changed no layout that mattered and are gone.
+/// Whether the boot letters (TU_DW_TRACE) hold `letter`: l logs each texture over a buffer (texture_log), v shadows every texture over
+/// host pages (T83). T80's o, w and r (other alignment answers) changed no layout that mattered and are gone.
 fn t80_letter(letter: char) -> bool {
     static LETTERS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     LETTERS.get_or_init(|| std::env::var("TU_DW_TRACE").unwrap_or_default()).contains(letter)
