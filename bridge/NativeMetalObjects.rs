@@ -652,48 +652,20 @@ pub extern "C" fn nmb_device_family_waivers(device: *const NmbDevice, out: *mut 
     })
 }
 
-/// The alignment this device answers for a linear texture's offset and rows in a buffer, where the runtime answers Metal's 16 (and
-/// takes 16): Turnip's linear images on the A810 start and step their rows at 64 bytes, so a texture placed at 16 is one the runtime
-/// cannot bind in place, and it shadows it and copies every byte in before each use (T76-T78: every shadow was for its pitch or its
-/// placement, a third of the GPU's time in the open/close animations). QuartzCore lays out its textures over buffers by the device's
-/// answer; one placed at 64 binds in place. The IOSurface answers stay the runtime's: no IOSurface texture was shadowed, and the
-/// compositor's surfaces keep their strides.
-const LINEAR_IN_PLACE: u64 = 64;
-
-/// Whether the boot letters (TU_DW_TRACE) hold `letter`: l logs each texture over a buffer (texture_log). T80's o, w and r (other
-/// alignment answers) changed no layout that mattered and are gone.
+/// Whether the boot letters (TU_DW_TRACE) hold `letter`: l logs each texture over a buffer (texture_log) and each linear alignment
+/// question (linear_answer).
 fn t80_letter(letter: char) -> bool {
     static LETTERS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     LETTERS.get_or_init(|| std::env::var("TU_DW_TRACE").unwrap_or_default()).contains(letter)
 }
 
-/// Whether this process is the render server (backboardd), whose textures over buffers the 64-byte answer binds in place.
-fn render_server() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        unsafe extern "C" {
-            fn getprogname() -> *const c_char;
-        }
-        // SAFETY: getprogname returns the process's name, a NUL-terminated string that lives as long as the process, or null.
-        let name = unsafe { getprogname() };
-        !name.is_null() && unsafe { CStr::from_ptr(name) }.to_bytes() == b"backboardd"
-    })
-}
-
-/// The linear alignment answered where the runtime answers `runtime`, for `selector` (and its argument, a pixel format or a width):
-/// at least LINEAR_IN_PLACE in the render server, the runtime's own elsewhere. T86: with 64 in the render server alone the blocks
-/// stayed, and with the runtime's 16 everywhere (T80o) they went: the render server's answer draws them, though every texture it
-/// sampled held its bytes as written (T85 dumps) and its GPU read them so (T83x). T87 letters put one answer back to the runtime's in
-/// the render server: A the format-free ones (deviceLinearTextureAlignmentBytes and its two siblings), B
-/// minimumLinearTextureAlignmentForPixelFormat:, C requiredLinearTextureBytesPerRowForDescriptor:'s row step. With l each distinct
-/// question and answer goes to m2v/gpu/answers-<pid>.txt once.
+/// The linear alignment answered for `selector` (and its argument, a pixel format or none): the runtime's own, Metal's 16. T79 answered
+/// the A810's 64 so Core Animation laid its textures over buffers at rows Turnip would bind in place, which took the shadows' copies
+/// away, but the render server then drew the wallpaper's blurred shadows in blocks (T79-T87: from the format-free answers, the only
+/// ones it asks, though every texture it sampled held its bytes as written). Turnip now binds such textures at 16-byte rows where they
+/// are only sampled (UniXNU patches/mesa/turnip-narrow-linear-rows.patch). With l each distinct question and answer goes to
+/// m2v/gpu/answers-<pid>.txt once.
 fn linear_answer(selector: &str, argument: u64, runtime: u64) -> u64 {
-    let letter = match selector {
-        "minimumLinearTextureAlignmentForPixelFormat:" => 'B',
-        "requiredLinearTextureBytesPerRowForDescriptor:" => 'C',
-        _ => 'A',
-    };
-    let answer = if render_server() && !t80_letter(letter) { runtime.max(LINEAR_IN_PLACE) } else { runtime };
     if t80_letter('l') {
         static SEEN: std::sync::Mutex<Vec<(String, u64)>> = std::sync::Mutex::new(Vec::new());
         let mut seen = SEEN.lock().unwrap_or_else(|p| p.into_inner());
@@ -702,12 +674,12 @@ fn linear_answer(selector: &str, argument: u64, runtime: u64) -> u64 {
             if let Some(path) = TEXTURE_LOG.get().and_then(|p| p.parent()).map(|d| d.join(format!("answers-{}.txt", std::process::id()))) {
                 use std::io::Write;
                 if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-                    let _ = writeln!(file, "{selector} {argument} runtime {runtime} answer {answer}");
+                    let _ = writeln!(file, "{selector} {argument} answer {runtime}");
                 }
             }
         }
     }
-    answer
+    runtime
 }
 
 fn device_answer(device: &NmbDevice, selector: &str, arg: u64) -> Result<u64, String> {
