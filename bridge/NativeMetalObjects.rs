@@ -662,8 +662,8 @@ fn t80_letter(letter: char) -> bool {
 /// The linear alignment answered for `selector` (and its argument, a pixel format or none): the runtime's own, Metal's 16. T79 answered
 /// the A810's 64 so Core Animation laid its textures over buffers at rows Turnip would bind in place, which took the shadows' copies
 /// away, but the render server then drew the wallpaper's blurred shadows in blocks (T79-T87: from the format-free answers, the only
-/// ones it asks, though every texture it sampled held its bytes as written). Turnip now binds such textures at 16-byte rows where they
-/// are only sampled (UniXNU patches/mesa/turnip-narrow-linear-rows.patch). With l each distinct question and answer goes to
+/// ones it asks, though every texture it sampled held its bytes as written and its GPU read them so). Shelved at 16 (2026-11-02); the
+/// untested idea for the copies is in the porting record (T88). With l each distinct question and answer goes to
 /// m2v/gpu/answers-<pid>.txt once.
 fn linear_answer(selector: &str, argument: u64, runtime: u64) -> u64 {
     if t80_letter('l') {

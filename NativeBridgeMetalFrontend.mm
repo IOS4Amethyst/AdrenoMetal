@@ -19,8 +19,6 @@
 #include <cmath>
 #include <atomic>
 #include <mutex>
-#include <set>
-#include <pwd.h>
 #include <pthread.h>
 #include <string>
 #include <unordered_map>
@@ -1514,49 +1512,14 @@ static void notified(void *context,uint64_t value) {
 // samples (a texture over an IOSurface or over a no-copy buffer, at most 1 MiB of rows) is hashed at commit and again at completion.
 // One that changed in between was rewritten by its client while the GPU could read it, which puts two frames' rows into one frame
 // (garbled labels, the status bar clock). Logged "native-metal: source-race ...", the first 50 of each kind and every 500th.
-// T85: also with the boot letter y (TU_DW_TRACE), which watches textures over any buffer and writes the CPU's bytes of the first
-// distinct small sources to files (dumpSource); the RC row counts the watched and rewritten sources.
-static bool traceLetter(char letter) {const char *letters=getenv("TU_DW_TRACE");return letters && strchr(letters,letter);}
-static bool dumpSources() {static const bool on=isRenderServer() && traceLetter('y');return on;}
-static bool watchSources() {
- static const bool on=isRenderServer() && (access("/private/var/ngpu/debug/source-race",F_OK)==0 || dumpSources());
- return on;
-}
-struct WatchedSource {const uint8_t *bytes;size_t length;uint64_t hash;bool surface;uint32_t width,height,row;NBTexture *texture;};
+static const bool gWatchSources=isRenderServer() && access("/private/var/ngpu/debug/source-race",F_OK)==0;
+struct WatchedSource {const uint8_t *bytes;size_t length;uint64_t hash;bool surface;uint32_t width,height,row;};
 static std::atomic<uint64_t> gSourcesWatched[2],gSourcesRaced[2];
 static uint64_t hashSource(const uint8_t *bytes,size_t length) {
  uint64_t hash=1469598103934665603ull,word;size_t at=0;
  for(;at+8<=length;at+=8){memcpy(&word,bytes+at,8);hash=(hash^word)*1099511628211ull;}
  for(;at<length;at++)hash=(hash^bytes[at])*1099511628211ull;
  return hash;
-}
-// T85 (boot letter y): the CPU's bytes of a sampled source as the commit hands it to the GPU, written once per distinct source (its
-// address, size and rows) to dump-<n>-f<format>-<width>x<height>-r<rows>-<s|b>.bin in the render server's m2v/gpu directory, which the
-// boot log's GPU export brings home: the first 48 distinct sources of at most 256 KiB, then every 25th up to 96. T83 showed the GPU
-// reads these bytes as they lie (229 read-backs equal) and draws blocks from copies of them too (T83v): whether the blocks are already
-// in the bytes decides between the writer and the GPU.
-static void dumpSource(const WatchedSource &source) {
- static std::mutex lock;
- static std::set<std::tuple<uintptr_t,uint32_t,uint32_t,uint32_t>> seen;
- static unsigned distinct,written;
- static char directory[512];
- if(!source.texture || source.length>(256u<<10))return;
- unsigned n;
- {
-  std::lock_guard<std::mutex> guard(lock);
-  if(written>=96 || !seen.insert({(uintptr_t)source.bytes,source.width,source.height,source.row}).second)return;
-  n=distinct++;
-  if(n>=48 && n%25)return;
-  if(!directory[0]) {
-   const passwd *user=getpwuid(getuid());
-   snprintf(directory,sizeof directory,"%s/Library/Caches/com.apple.backboardd/m2v/gpu",user && user->pw_dir?user->pw_dir:"/private/var/mobile");
-  }
-  written++;
- }
- char path[640];
- snprintf(path,sizeof path,"%s/dump-%d-%03u-f%llu-%ux%u-r%u-%c.bin",directory,(int)getpid(),n,(unsigned long long)source.texture.descriptor.format,
-          source.width,source.height,source.row,source.surface?'s':'b');
- if(FILE *file=fopen(path,"wb")){fwrite(source.bytes,1,source.length,file);fclose(file);}
 }
 // With the texture log on, the 30 commits after /private/var/ngpu/debug/dump-now is touched (its modification time changes;
 // the render server may read it but not remove it) list every texture they use in surf/manifest.txt of this process's temporary
@@ -1634,7 +1597,7 @@ static void dumpSurfacesOnce(NSSet *textures,NSSet *owners) {
 // Runtime handles retain GPU storage, but only the Objective-C owner retains
 // a no-copy deallocator, its memory owner and texture/heap ancestry.
 @property(nonatomic,strong) NSMutableSet *resourceOwners;
-// The sampled sources watched for a rewrite while the GPU could read them (watchSources), kept alive until completion.
+// The sampled sources watched for a rewrite while the GPU could read them (gWatchSources), kept alive until completion.
 @property(nonatomic,strong) NSMutableSet *sampled;
 - (void)watchTexture:(NBTexture *)texture;
 @property(nonatomic,strong) dispatch_group_t handlers;
@@ -1999,7 +1962,7 @@ static void writeDrawStats() {
  if(texture)[_commandBuffer.resourceOwners addObject:texture];
  [self dumpBind:texture index:index stage:stage+4];
  if(texture && [(NBTexture *)texture surface])[_commandBuffer.surfaces addObject:texture];
- if(texture && watchSources())[_commandBuffer watchTexture:(NBTexture *)texture];
+ if(texture && gWatchSources)[_commandBuffer watchTexture:(NBTexture *)texture];
  ENCODE([self check:nmb_encoder_set_texture(self->_handle,stage,texture?[(NBTexture *)texture handle]:nullptr,(uint32_t)index) what:"setTexture"]);
 }
 - (void)sampler:(id<MTLSamplerState>)sampler index:(NSUInteger)index stage:(uint32_t)stage {
@@ -2554,14 +2517,13 @@ static char kUserDictionaryKey;
 - (void)dealloc {nmb_command_buffer_release(_handle);}
 - (void)watchTexture:(NBTexture *)texture {
  const uint8_t *bytes=texture.surface?(const uint8_t *)IOSurfaceGetBaseAddress(texture.surface):(const uint8_t *)texture.buffer.wrapped;
- if(!bytes && texture.buffer && dumpSources())bytes=(const uint8_t *)[texture.buffer contents];
  const size_t length=(size_t)texture.rowBytes*(size_t)texture.descriptor.height;
  if(!bytes || !length || length>(1u<<20) || self.committed)return;
  if(!_sampled)_sampled=[NSMutableSet set];
  if([_sampled containsObject:texture])return;
  [_sampled addObject:texture];
  watched.push_back({bytes+texture.offset,length,0,texture.surface!=nullptr,(uint32_t)texture.descriptor.width,
-                    (uint32_t)texture.descriptor.height,(uint32_t)texture.rowBytes,texture});
+                    (uint32_t)texture.descriptor.height,(uint32_t)texture.rowBytes});
 }
 - (id<MTLCommandQueue>)commandQueue {return (id<MTLCommandQueue>)_queue;}
 - (BOOL)retainedReferences {return YES;}
@@ -2811,10 +2773,7 @@ static char kUserDictionaryKey;
  if(!self.encodeFailure) {
   flushSurfaces(_surfaces);
   if(gLogTextures)dumpSurfacesOnce(_surfaces,_resourceOwners);
-  for(WatchedSource &source:watched) {
-   source.hash=hashSource(source.bytes,source.length);gSourcesWatched[source.surface]++;
-   if(dumpSources())dumpSource(source);
-  }
+  for(WatchedSource &source:watched){source.hash=hashSource(source.bytes,source.length);gSourcesWatched[source.surface]++;}
   // Completion owns this reference; the runtime orders the non-owning scheduled callback before it.
   void *context=(__bridge_retained void *)self;
   const uint64_t appIndex=self.dumpReadback?0:gAppCommits.fetch_add(1)+1;
@@ -4286,11 +4245,6 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   (unsigned long long)gNoCopyMade.load(),
   (unsigned long long)gSurfaceImportsReleased.load(),(unsigned long long)gSurfaceImportsMade.load());
  {uint64_t remaps[2]={};if(nmb_no_copy_remaps(remaps))row("N no-copy ranges checked %llu remapped %llu",(unsigned long long)remaps[0],(unsigned long long)remaps[1]);}
- // T85 (boot letter y): sources watched and rewritten while the GPU could read them (buffers/surfaces).
- if(watchSources()) {
-  auto u=[](std::atomic<uint64_t> &v){return (unsigned long long)v.load();};
-  row("RC watched %llu/%llu raced %llu/%llu",u(gSourcesWatched[0]),u(gSourcesWatched[1]),u(gSourcesRaced[0]),u(gSourcesRaced[1]));
- }
  // The runtime's VkPipeline makings (the creation log, METAL2VULKAN_LOG_PIPELINES; they happen at draws, not at the state's creation) and
  // its shader cache: where the driver's compile time goes.
  uint64_t work[10]={};
